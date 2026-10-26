@@ -116,12 +116,13 @@ run_oneclick() {
         echo "中止：镜像地址预检未通过（可能网络问题），旧系统未动。" >&2
         exit 1
     fi
-    # 把本机硬盘驱动打包进内存系统（修复 kexec 后内存系统认不出盘的问题：
-    # 内存系统自带无内核模块，而目标的 SATA/virtio/NVMe 驱动通常是模块，
-    # 平时从运行系统的 /lib/modules 加载，kexec 后该目录已不在）。
+    # 把本机硬盘与网卡驱动打包进内存系统（修复 kexec 后内存系统认不出盘、
+    # 认不出网卡的问题：内存系统自带无内核模块，而目标的 SATA/virtio/NVMe
+    # 与网卡驱动通常是模块，平时从运行系统的 /lib/modules 加载，kexec 后
+    # 该目录已不在）。
     # 若未找到可打包模块（驱动可能是内置的），则直接用原内存系统。
     # 打包失败会在 kexec 前中止（旧系统未动）。
-    echo "正在把本机硬盘驱动打包进内存系统..."
+    echo "正在把本机硬盘与网卡驱动打包进内存系统..."
     INITRD_PATH="/tmp/dd-initramfs.cpio.gz"
     MODDIR="/lib/modules/$(uname -r)"
     if [ -d "$MODDIR" ]; then
@@ -134,11 +135,11 @@ run_oneclick() {
                     KO_PATH="$(modinfo -F filename "$mod" 2>/dev/null || echo "")"
                 fi
                 case "$KO_PATH" in
-                    */drivers/ata/*|*/drivers/scsi/*|*/drivers/virtio/*|*/drivers/block/*|*/drivers/nvme/*|*/drivers/message/*)
+                    */drivers/ata/*|*/drivers/scsi/*|*/drivers/virtio/*|*/drivers/block/*|*/drivers/nvme/*|*/drivers/message/*|*/drivers/net/*)
                         echo "$mod" >> "$MOD_LIST_TMP" ;;
                 esac
                 case "$mod" in
-                    sd_mod|scsi_mod|libata|ata_piix|ahci|libahci|virtio_blk|virtio_scsi|virtio|virtio_ring|nvme_core|nvme|dm_mod)
+                    sd_mod|scsi_mod|libata|ata_piix|ahci|libahci|virtio_blk|virtio_scsi|virtio|virtio_ring|nvme_core|nvme|dm_mod|virtio_net|e1000|e1000e|r8169|igb|ixgbe|vmxnet3|hv_netvsc)
                         echo "$mod" >> "$MOD_LIST_TMP" ;;
                 esac
             done
@@ -147,7 +148,7 @@ run_oneclick() {
             DRV_NAME="$(basename "$(readlink "/sys/block/$DISK_BASE/device/driver")" 2>/dev/null || echo "")"
             [ -n "$DRV_NAME" ] && echo "$DRV_NAME" >> "$MOD_LIST_TMP"
         fi
-        for m in sd_mod scsi_mod libata virtio_blk virtio_scsi virtio virtio_ring nvme_core nvme ata_piix ahci; do
+        for m in sd_mod scsi_mod libata virtio_blk virtio_scsi virtio virtio_ring nvme_core nvme ata_piix ahci virtio_net e1000 e1000e r8169; do
             echo "$m" >> "$MOD_LIST_TMP"
         done
         sort -u "$MOD_LIST_TMP" -o "$MOD_LIST_TMP" 2>/dev/null || true
