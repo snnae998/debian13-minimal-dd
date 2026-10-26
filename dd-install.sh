@@ -11,7 +11,7 @@
 #   不知道盘名时直接运行 bash dd-install.sh --oneclick，脚本会列出本机磁盘让你选。
 #   跳过确认：bash dd-install.sh --oneclick /dev/sda --yes
 #   内存阶段静态网络（DHCP 失败时备用）：--static-ip 1.2.3.4/24 --static-gw 1.2.3.4 --static-dns "8.8.8.8,1.1.1.1"
-# 一键模式前提：内核支持 kexec 且已装 kexec-tools；内存阶段与新系统均需 DHCP；
+# 一键模式前提：内核支持 kexec 且已装 kexec-tools；未给 --static-* 时自动从当前系统检测 IP/网关/DNS，DD 后该静态会写进新系统（DHCP 不通的商家也能直接 SSH，无需再 VNC 一次）。
 # kexec 触发后旧系统即消失，失败时需面板/VNC/救援恢复；先在测试机上试。
 # 注意：会清空目标盘全部数据；--force 在 v2 已无作用（UEFI 已支持），保留仅为兼容旧命令。
 set -euo pipefail
@@ -23,7 +23,7 @@ IMAGE_SIZE_MIN=1073741824  # 1 GiB
 PART_SHAS="b293011b6cbfba60746887a080755cc1e426962e7e4f2a63af6dafe03a0f6cc0,577d8e1a43a4d044c8f2c7698f0c3b7c5fa60a23a0e523f37440ebaa1d8f280d,64b6f43335455b664ff431e82e19ef51d18c4280e73ccb1bfae27528e6c94dcd,9764fa83042d3aba6ca40d149a02103c8d080f827567527c46b58151e17ea980,8b1442a511c5ac601dab27ebdd147cf55518d33c2e0ff7c16ae51aaf474dbb4a"
 # 一键模式内存系统（initramfs）地址与 SHA
 INITRAMFS_URL_DEFAULT="https://raw.githubusercontent.com/snnae998/debian13-minimal-dd/main/initramfs-dd-v2.cpio.gz"
-INITRAMFS_SHA256="418933b1ba03ad72632ea52b2d098da82f29fa026de1294debbd27ec9bddb25b"
+INITRAMFS_SHA256="53449c9f0bb29141c5865f91b0daad75dd56af8bf368be6cb7c129789e7cf69d"
 
 # v2 固定布局（1 GiB 镜像内，单位：512 字节扇区）
 ESP_START=1900544
@@ -37,6 +37,33 @@ show_disks() {
     lsblk -d -o NAME,SIZE,MODEL -e 1,7,11 2>/dev/null || lsblk -d -o NAME,SIZE,MODEL 2>/dev/null || true
     echo "常见盘名：KVM virtio 是 vda，SATA/SCSI 是 sda，NVMe 是 nvme0n1；"
     echo "不要选带数字的分区，如 sda1、vda1、nvme0n1p1。"
+}
+
+# 一键模式：从当前运行系统自动检测静态网络（免手动输 --static-*）。
+# 检测：有默认路由的接口的 IPv4、默认网关、/etc/resolv.conf 前 1-2 个
+# 非回环 nameserver（过滤 127.*，因内存系统无 resolved，127.0.0.53 不可用；
+# 若无可用 DNS 则默认 8.8.8.8）。手动给的 --static-* 优先，检测只补缺失项。
+# 成功（IP+网关都有）返回 0 并设置 DETECT_IP/DETECT_GW/DETECT_DNS；
+# 缺 IP 或缺网关返回 1（调用方在 kexec 前报错，不进内存系统）。
+detect_static() {
+    DETECT_IP=""; DETECT_GW=""; DETECT_DNS=""
+    local nic="" gw="" ip=""
+    nic="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)"
+    if [ -n "$nic" ]; then
+        ip="$(ip -4 addr show dev "$nic" 2>/dev/null | awk '/inet / {print $2; exit}' || true)"
+        gw="$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}' || true)"
+    fi
+    if [ -n "$ip" ] && [ -n "$gw" ]; then
+        DETECT_IP="$ip"; DETECT_GW="$gw"
+        if [ -f /etc/resolv.conf ]; then
+            DETECT_DNS="$(awk '/^nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null | grep -v '^127\.' | head -n 2 | paste -sd, - 2>/dev/null || true)"
+        fi
+        if [ -z "$DETECT_DNS" ]; then
+            DETECT_DNS="8.8.8.8"
+        fi
+        return 0
+    fi
+    return 1
 }
 
 # 一键模式：预检 -> 下载内存系统 -> 确认 -> kexec 进内存写盘。
@@ -100,6 +127,28 @@ run_oneclick() {
     if [ -n "$DISK_SIZE" ]; then
         echo "目标盘容量：$((DISK_SIZE / 1024 / 1024)) MiB"
     fi
+    # 静态参数：手动优先，缺失项自动检测补齐；都检测不到则 kexec 前报错。
+    # （手动给的 --static-* 不会被覆盖；自动检测只填没给的项。）
+    if [ -z "$STATIC_IP" ] || [ -z "$STATIC_GW" ] || [ -z "$STATIC_DNS" ]; then
+        if detect_static; then
+            [ -z "$STATIC_IP" ] && STATIC_IP="$DETECT_IP"
+            [ -z "$STATIC_GW" ] && STATIC_GW="$DETECT_GW"
+            [ -z "$STATIC_DNS" ] && STATIC_DNS="$DETECT_DNS"
+            echo "静态网络（手动+自动）：IP=$STATIC_IP 网关=$STATIC_GW DNS=$STATIC_DNS"
+        else
+            # 检测失败：若已手动给了 IP+网关，则不算失败（DNS 可默认），继续；
+            # 否则（缺 IP 或缺网关）kexec 前报错，不进内存系统。
+            if [ -z "$STATIC_IP" ] || [ -z "$STATIC_GW" ]; then
+                echo "中止：未手动给 --static-ip/--static-gw，且自动检测不到当前系统的 IP/网关（可能本机无网络或无默认路由）。" >&2
+                echo "请先给本机配好网络，或手动给静态参数再跑，例如：" >&2
+                echo "  bash dd-install.sh --oneclick $DISK --static-ip 1.2.3.4/24 --static-gw 1.2.3.4 --static-dns 8.8.8.8" >&2
+                echo "（若你商家 DHCP 能通、想纯 DHCP，也请先确保本机当前有 IP，否则连内存系统都下不下来。）" >&2
+                exit 1
+            fi
+            # 手动 IP+网关已给，仅 DNS 缺失：默认 8.8.8.8（不依赖检测）。
+            [ -z "$STATIC_DNS" ] && STATIC_DNS="8.8.8.8"
+        fi
+    fi
     INITRAMFS_URL="${INITRAMFS_URL_OVERRIDE:-$INITRAMFS_URL_DEFAULT}"
     echo "正在下载内存系统（initramfs，约 6MB）..."
     cd /tmp
@@ -161,6 +210,20 @@ run_oneclick() {
                 find "$MODDIR" -name "$mod.ko*" 2>/dev/null >> "$KO_LIST_TMP" || true
             fi
         done
+        # 追加 btrfs 模块及依赖（供内存系统 DD 后挂载新 root、写静态网络用）。
+        # best-effort：找不到/内置时不中止，/init 挂载失败时会警告并退回 DHCP。
+        if command -v modprobe >/dev/null 2>&1; then
+            modprobe --show-depends btrfs 2>/dev/null | awk '{print $2}' >> "$KO_LIST_TMP" 2>/dev/null || true
+        fi
+        if ! grep -q "/btrfs\.ko" "$KO_LIST_TMP" 2>/dev/null; then
+            find "$MODDIR" -name "btrfs.ko*" 2>/dev/null >> "$KO_LIST_TMP" || true
+            # 常见依赖（若 modprobe 未覆盖）：libcrc32c 是 btrfs 必需，raid6_pq/xor 用于 raid。
+            for dep in libcrc32c raid6_pq xor; do
+                if ! grep -q "/$dep\.ko" "$KO_LIST_TMP" 2>/dev/null; then
+                    find "$MODDIR" -name "$dep.ko*" 2>/dev/null >> "$KO_LIST_TMP" || true
+                fi
+            done
+        fi
         awk '!seen[$0]++' "$KO_LIST_TMP" > "$KO_LIST_TMP.uniq" 2>/dev/null || cp "$KO_LIST_TMP" "$KO_LIST_TMP.uniq" 2>/dev/null || true
         rm -f "$MOD_LIST_TMP" "$KO_LIST_TMP" || true
         if [ -s "$KO_LIST_TMP.uniq" ]; then
@@ -204,7 +267,7 @@ run_oneclick() {
                 if (cd "$BUNDLE_DIR" && find . -print0 | cpio --null -o -H newc 2>/dev/null | gzip -9 > /tmp/dd-initramfs-bundled.cpio.gz); then
                     if gzip -dc /tmp/dd-initramfs-bundled.cpio.gz | cpio -t 2>/dev/null | grep -q 'lib/modules/load_order.txt'; then
                         INITRD_PATH="/tmp/dd-initramfs-bundled.cpio.gz"
-                        echo "已打包 $BUNDLED_N 个硬盘驱动模块进内存系统。"
+                        echo "已打包 $BUNDLED_N 个模块进内存系统（含硬盘/网卡驱动与 btrfs，供 DD 后挂载新 root 写静态用）。"
                     else
                         echo "中止：打包后的内存系统校验失败，旧系统未动。" >&2
                         rm -rf "$BUNDLE_DIR" || true
@@ -231,7 +294,7 @@ run_oneclick() {
     lsblk "$DISK" || true
     echo
     echo "警告：一键 DD 将清空 $DISK 全部数据，且 kexec 触发后当前系统即消失！"
-    echo "内存阶段需要 DHCP 能拿到地址（新系统也是 networkd DHCP）；"
+    echo "静态网络：IP=$STATIC_IP 网关=$STATIC_GW DNS=$STATIC_DNS（手动优先，未给则自动检测）；DD 完成后该静态会写进新系统，新系统启动即有 IP（DHCP 不通也不用再 VNC 一次）。"
     echo "若内存阶段联网或下载失败，机器会停在内存系统里，需面板/VNC/救援恢复。"
     echo "请确认你有面板/VNC/救援入口，且目标盘无重要数据。"
     if [ "$YES" -ne 1 ]; then
@@ -529,7 +592,7 @@ if [ "$HAVE_BTRFS" -eq 1 ]; then
         echo "默认走 DHCP（networkd 自动匹配网卡）；如需静态配置请选 y（直接回车保持 DHCP）。"
         read -rp "是否写入静态网络配置？(y/N): " SET_STATIC || true
         if [ "${SET_STATIC:-}" = "y" ] || [ "${SET_STATIC:-}" = "Y" ]; then
-            read -rp "IP 地址（如 38.147.165.150）: " STATIC_IP || true
+            read -rp "IP 地址（如 1.2.3.450）: " STATIC_IP || true
             if [ -n "${STATIC_IP:-}" ]; then
                 STATIC_GW_DEFAULT="$(echo "$STATIC_IP" | awk -F. '{print $1"."$2"."$3".1"}')"
                 read -rp "前缀长度（默认 24）: " STATIC_PREFIX || true
