@@ -23,7 +23,7 @@ IMAGE_SIZE_MIN=1073741824  # 1 GiB
 PART_SHAS="b293011b6cbfba60746887a080755cc1e426962e7e4f2a63af6dafe03a0f6cc0,577d8e1a43a4d044c8f2c7698f0c3b7c5fa60a23a0e523f37440ebaa1d8f280d,64b6f43335455b664ff431e82e19ef51d18c4280e73ccb1bfae27528e6c94dcd,9764fa83042d3aba6ca40d149a02103c8d080f827567527c46b58151e17ea980,8b1442a511c5ac601dab27ebdd147cf55518d33c2e0ff7c16ae51aaf474dbb4a"
 # 一键模式内存系统（initramfs）地址与 SHA
 INITRAMFS_URL_DEFAULT="https://raw.githubusercontent.com/snnae998/debian13-minimal-dd/main/initramfs-dd-v2.cpio.gz"
-INITRAMFS_SHA256="c40124470260b69d63c6286481ac1bc350613129afbaec2bf3b2144fc658ed3e"
+INITRAMFS_SHA256="355274f771dc837396174da5eb3fc1ae8a07f0ae2f946367f0db63dbd1c2255b"
 
 # v2 固定布局（1 GiB 镜像内，单位：512 字节扇区）
 ESP_START=1900544
@@ -46,10 +46,14 @@ run_oneclick() {
     echo "原理：先在运行系统里预检并下载内存系统，再 kexec 重启进内存，"
     echo "在内存里写盘（旧系统已不在，不会变僵尸），写完自动重启进新系统。"
     KERNEL=""
-    if [ -f /boot/vmlinuz ]; then
-        KERNEL="$(readlink -f /boot/vmlinuz)"
-    elif [ -f "/boot/vmlinuz-$(uname -r)" ]; then
+    # Prefer the kernel matching the running version, so that the storage
+    # modules bundled below (from /lib/modules/$(uname -r)) match the
+    # kexec'd kernel. The generic /boot/vmlinuz may point to a newer
+    # kernel after an update without reboot, whose modules would mismatch.
+    if [ -f "/boot/vmlinuz-$(uname -r)" ]; then
         KERNEL="/boot/vmlinuz-$(uname -r)"
+    elif [ -f /boot/vmlinuz ]; then
+        KERNEL="$(readlink -f /boot/vmlinuz)"
     else
         for k in /boot/vmlinuz-*; do
             [ -f "$k" ] && KERNEL="$k"
@@ -112,6 +116,115 @@ run_oneclick() {
         echo "中止：镜像地址预检未通过（可能网络问题），旧系统未动。" >&2
         exit 1
     fi
+    # 把本机硬盘驱动打包进内存系统（修复 kexec 后内存系统认不出盘的问题：
+    # 内存系统自带无内核模块，而目标的 SATA/virtio/NVMe 驱动通常是模块，
+    # 平时从运行系统的 /lib/modules 加载，kexec 后该目录已不在）。
+    # 若未找到可打包模块（驱动可能是内置的），则直接用原内存系统。
+    # 打包失败会在 kexec 前中止（旧系统未动）。
+    echo "正在把本机硬盘驱动打包进内存系统..."
+    INITRD_PATH="/tmp/dd-initramfs.cpio.gz"
+    MODDIR="/lib/modules/$(uname -r)"
+    if [ -d "$MODDIR" ]; then
+        DISK_BASE="$(basename "$DISK")"
+        MOD_LIST_TMP="$(mktemp /tmp/dd-mods.XXXXXX)" || { echo "中止：无法创建临时文件，旧系统未动。" >&2; exit 1; }
+        if command -v lsmod >/dev/null 2>&1; then
+            for mod in $(lsmod 2>/dev/null | awk 'NR>1 {print $1}' || true); do
+                KO_PATH=""
+                if command -v modinfo >/dev/null 2>&1; then
+                    KO_PATH="$(modinfo -F filename "$mod" 2>/dev/null || echo "")"
+                fi
+                case "$KO_PATH" in
+                    */drivers/ata/*|*/drivers/scsi/*|*/drivers/virtio/*|*/drivers/block/*|*/drivers/nvme/*|*/drivers/message/*)
+                        echo "$mod" >> "$MOD_LIST_TMP" ;;
+                esac
+                case "$mod" in
+                    sd_mod|scsi_mod|libata|ata_piix|ahci|libahci|virtio_blk|virtio_scsi|virtio|virtio_ring|nvme_core|nvme|dm_mod)
+                        echo "$mod" >> "$MOD_LIST_TMP" ;;
+                esac
+            done
+        fi
+        if [ -e "/sys/block/$DISK_BASE/device/driver" ]; then
+            DRV_NAME="$(basename "$(readlink "/sys/block/$DISK_BASE/device/driver")" 2>/dev/null || echo "")"
+            [ -n "$DRV_NAME" ] && echo "$DRV_NAME" >> "$MOD_LIST_TMP"
+        fi
+        for m in sd_mod scsi_mod libata virtio_blk virtio_scsi virtio virtio_ring nvme_core nvme ata_piix ahci; do
+            echo "$m" >> "$MOD_LIST_TMP"
+        done
+        sort -u "$MOD_LIST_TMP" -o "$MOD_LIST_TMP" 2>/dev/null || true
+        KO_LIST_TMP="$(mktemp /tmp/dd-kos.XXXXXX)" || { echo "中止：无法创建临时文件，旧系统未动。" >&2; rm -f "$MOD_LIST_TMP" || true; exit 1; }
+        for mod in $(cat "$MOD_LIST_TMP" 2>/dev/null || true); do
+            if command -v modprobe >/dev/null 2>&1; then
+                modprobe --show-depends "$mod" 2>/dev/null | awk '{print $2}' >> "$KO_LIST_TMP" 2>/dev/null || true
+            fi
+            if ! grep -q "/$mod\.ko" "$KO_LIST_TMP" 2>/dev/null; then
+                find "$MODDIR" -name "$mod.ko*" 2>/dev/null >> "$KO_LIST_TMP" || true
+            fi
+        done
+        awk '!seen[$0]++' "$KO_LIST_TMP" > "$KO_LIST_TMP.uniq" 2>/dev/null || cp "$KO_LIST_TMP" "$KO_LIST_TMP.uniq" 2>/dev/null || true
+        rm -f "$MOD_LIST_TMP" "$KO_LIST_TMP" || true
+        if [ -s "$KO_LIST_TMP.uniq" ]; then
+            if ! command -v cpio >/dev/null 2>&1; then
+                echo "正在安装 cpio（打包驱动需要）..."
+                if command -v apt-get >/dev/null 2>&1; then
+                    apt-get install -y cpio >/dev/null 2>&1 || true
+                fi
+            fi
+            if ! command -v cpio >/dev/null 2>&1; then
+                echo "中止：需要 cpio 来打包驱动，但安装失败；请先 apt install cpio 后重试，旧系统未动。" >&2
+                rm -f "$KO_LIST_TMP.uniq" || true
+                exit 1
+            fi
+            BUNDLE_DIR="$(mktemp -d /tmp/dd-bundle.XXXXXX)" || { echo "中止：无法创建打包目录，旧系统未动。" >&2; rm -f "$KO_LIST_TMP.uniq" || true; exit 1; }
+            if ! (cd "$BUNDLE_DIR" && gzip -dc /tmp/dd-initramfs.cpio.gz | cpio -id --quiet 2>/dev/null); then
+                echo "中止：内存系统解包失败，旧系统未动。" >&2
+                rm -rf "$BUNDLE_DIR" || true; rm -f "$KO_LIST_TMP.uniq" || true
+                exit 1
+            fi
+            mkdir -p "$BUNDLE_DIR/lib/modules" || { echo "中止：无法创建模块目录，旧系统未动。" >&2; rm -rf "$BUNDLE_DIR" || true; rm -f "$KO_LIST_TMP.uniq" || true; exit 1; }
+            : > "$BUNDLE_DIR/lib/modules/load_order.txt" || { echo "中止：无法写模块清单，旧系统未动。" >&2; rm -rf "$BUNDLE_DIR" || true; rm -f "$KO_LIST_TMP.uniq" || true; exit 1; }
+            BUNDLED_N=0
+            while IFS= read -r KO; do
+                [ -n "$KO" ] || continue
+                [ -f "$KO" ] || continue
+                BASE="$(basename "$KO")"
+                OUT_BASE="$BASE"
+                case "$BASE" in
+                    *.ko.zst) OUT_BASE="${BASE%.ko.zst}.ko"; zstd -dc "$KO" > "$BUNDLE_DIR/lib/modules/$OUT_BASE" 2>/dev/null || continue ;;
+                    *.ko.xz) OUT_BASE="${BASE%.ko.xz}.ko"; xz -dc "$KO" > "$BUNDLE_DIR/lib/modules/$OUT_BASE" 2>/dev/null || continue ;;
+                    *.ko.gz) OUT_BASE="${BASE%.ko.gz}.ko"; gzip -dc "$KO" > "$BUNDLE_DIR/lib/modules/$OUT_BASE" 2>/dev/null || continue ;;
+                    *) cp "$KO" "$BUNDLE_DIR/lib/modules/$OUT_BASE" 2>/dev/null || continue ;;
+                esac
+                echo "$OUT_BASE" >> "$BUNDLE_DIR/lib/modules/load_order.txt"
+                BUNDLED_N=$((BUNDLED_N + 1))
+            done < "$KO_LIST_TMP.uniq"
+            rm -f "$KO_LIST_TMP.uniq" || true
+            awk '!seen[$0]++' "$BUNDLE_DIR/lib/modules/load_order.txt" > "$BUNDLE_DIR/load_order.uniq" 2>/dev/null && mv "$BUNDLE_DIR/load_order.uniq" "$BUNDLE_DIR/lib/modules/load_order.txt" 2>/dev/null || true
+            if [ "$BUNDLED_N" -gt 0 ] && [ -s "$BUNDLE_DIR/lib/modules/load_order.txt" ]; then
+                if (cd "$BUNDLE_DIR" && find . -print0 | cpio --null -o -H newc 2>/dev/null | gzip -9 > /tmp/dd-initramfs-bundled.cpio.gz); then
+                    if gzip -dc /tmp/dd-initramfs-bundled.cpio.gz | cpio -t 2>/dev/null | grep -q 'lib/modules/load_order.txt'; then
+                        INITRD_PATH="/tmp/dd-initramfs-bundled.cpio.gz"
+                        echo "已打包 $BUNDLED_N 个硬盘驱动模块进内存系统。"
+                    else
+                        echo "中止：打包后的内存系统校验失败，旧系统未动。" >&2
+                        rm -rf "$BUNDLE_DIR" || true
+                        exit 1
+                    fi
+                else
+                    echo "中止：内存系统重打包失败，旧系统未动。" >&2
+                    rm -rf "$BUNDLE_DIR" || true
+                    exit 1
+                fi
+            else
+                echo "警告：未打包到任何驱动模块，直接使用原内存系统（若驱动是内置的则仍可工作）。"
+            fi
+            rm -rf "$BUNDLE_DIR" || true
+        else
+            rm -f "$KO_LIST_TMP.uniq" || true
+            echo "未找到可打包的硬盘驱动模块（可能是内置驱动），直接使用原内存系统。"
+        fi
+    else
+        echo "警告：找不到本机模块目录 $MODDIR，无法打包驱动；若硬盘驱动是模块，内存系统可能认不出盘。"
+    fi
     echo
     echo "目标盘：$DISK"
     lsblk "$DISK" || true
@@ -138,7 +251,7 @@ run_oneclick() {
         CMDLINE="$CMDLINE dd.static_dns=$STATIC_DNS"
     fi
     echo "正在载入 kexec（内核 + 内存系统）..."
-    if ! kexec -l "$KERNEL" --initrd=/tmp/dd-initramfs.cpio.gz --append="$CMDLINE"; then
+    if ! kexec -l "$KERNEL" --initrd="$INITRD_PATH" --append="$CMDLINE"; then
         echo "中止：kexec 载入失败，旧系统未动。" >&2
         exit 1
     fi
