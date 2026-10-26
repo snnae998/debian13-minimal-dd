@@ -3,6 +3,7 @@
 # 用法（救援模式或现有 Linux，root 运行）：
 #   curl -fsSL https://raw.githubusercontent.com/snnae998/debian13-minimal-dd/main/dd-install.sh -o dd-install.sh
 #   bash dd-install.sh /dev/vda [--force]
+#   不知道盘名时直接运行 bash dd-install.sh，不给盘名，脚本会列出本机磁盘让你选。
 # 注意：会清空目标盘全部数据；--force 仅跳过 UEFI 启动方式检查，不跳过确认。
 set -euo pipefail
 
@@ -21,9 +22,38 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+show_disks() {
+    echo "本机磁盘如下（选和你机器配置相符的那块整盘，不要选带数字的分区）："
+    lsblk -d -o NAME,SIZE,MODEL -e 1,7,11 2>/dev/null || lsblk -d -o NAME,SIZE,MODEL 2>/dev/null || true
+    echo "常见盘名：KVM virtio 是 vda，SATA/SCSI 是 sda，NVMe 是 nvme0n1；"
+    echo "不要选带数字的分区，如 sda1、vda1、nvme0n1p1。"
+}
+
+# 磁盘参数：没给或给错时，列出磁盘并引导用户输入
 if [ -z "$DISK" ] || [ ! -b "$DISK" ]; then
-    echo "用法: bash dd-install.sh /dev/vda [--force]" >&2
-    lsblk -d -o NAME,SIZE,MODEL 2>/dev/null || true
+    if [ -n "$DISK" ]; then
+        echo "没有找到磁盘：$DISK" >&2
+    fi
+    echo "先看本机磁盘，选一块整盘："
+    show_disks
+    echo
+    read -rp "输入目标盘名（例如 /dev/sda，直接回车退出）: " DISK_INPUT
+    if [ -z "$DISK_INPUT" ]; then
+        echo "已取消"
+        exit 1
+    fi
+    DISK="$DISK_INPUT"
+    if [ ! -b "$DISK" ]; then
+        echo "错误：$DISK 不是块设备，请重新运行并输入上面列表里的盘名。" >&2
+        exit 1
+    fi
+fi
+
+# 分区保护：DD 必须写整盘，写分区会破坏镜像自身的分区表
+DISK_TYPE="$(lsblk -n -o TYPE "$DISK" 2>/dev/null || echo "")"
+if [ "$DISK_TYPE" = "part" ]; then
+    echo "错误：$DISK 是分区不是整盘，DD 必须写整盘（如 /dev/sda），请重新运行。" >&2
+    show_disks
     exit 1
 fi
 
