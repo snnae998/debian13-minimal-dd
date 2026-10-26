@@ -15,14 +15,25 @@
 - 其他：无 swap、无 cloud-init
 - 首启：自动 btrfs resize max（大盘扩容）+ balance（v2 出厂已是 single，balance 很快完成；期间以 `btrfs filesystem usage /` 为准）
 
-## 一键 DD（救援模式或现有 Linux，root 运行）
+## 一键 DD（运行系统中，kexec 版）
+
+在运行中的系统里直接 DD，不用进救援模式。脚本先 kexec 进内存里的最小系统（initramfs，约 6MB），再由内存系统写盘——正在运行的系统在 kexec 那一刻就被放弃，不是后台写盘，不会把自己写死。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/snnae998/debian13-minimal-dd/main/dd-install.sh -o dd-install.sh
+bash dd-install.sh --oneclick /dev/sda
+```
+
+前置条件：目标机内核支持 kexec 且装有 kexec-tools（没有时脚本会在 kexec 前中止，旧系统不受影响）；内存系统与新系统都需要 DHCP 能拿到地址（新系统是 networkd DHCP；DHCP 不可用时可用 `--static-ip/--static-gw/--static-dns` 给内存系统指定静态地址，新系统首登后再改静态）；确认时需输入 `YES`（或加 `--yes` 跳过）。kexec 是不可逆点：执行后当前系统消失，写盘在内存系统里完成（分卷逐个下载、SHA 校验、流式解压写盘；大盘同样先把 ESP 挪到盘尾再扩 root，文件系统扩容仍由新系统首启完成）。中途失败时机器停在内存系统并给出 console shell，用面板/VNC 进去看日志，不要直接重启（半写盘重启会进不了系统）；救援模式仍可用（重启进救援再跑下面的救援版）。镜像包与 v2.0 相同（5 个分卷，SHA 不变），initramfs 由脚本下载并校验 SHA256。
+
+## 一键 DD（救援模式）
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/snnae998/debian13-minimal-dd/main/dd-install.sh -o dd-install.sh
 bash dd-install.sh /dev/vda
 ```
 
-脚本流程：先确认目标盘（不知道盘名时直接运行 `bash dd-install.sh`，不给盘名，脚本会列出本机磁盘让你选；不要选带数字的分区，DD 必须写整盘），再预检（启动方式、磁盘容量、主网卡名、收尾工具），汇总报告并经你确认后才写入；写入后、重启前自动收尾（大盘先把 ESP 挪到盘尾再扩 root，并可按提示设置主机名与静态网络）；全程校验 SHA256。UEFI 与 BIOS 均可（v2 双启动，不再因 UEFI 中止）。目标盘有已挂载分区时脚本会拒绝并打印救援模式步骤，不要在运行系统里后台 DD。
+脚本流程：先确认目标盘（不知道盘名时直接运行 `bash dd-install.sh`，不给盘名，脚本会列出本机磁盘让你选；不要选带数字的分区，DD 必须写整盘），再预检（启动方式、磁盘容量、主网卡名、收尾工具），汇总报告并经你确认后才写入；写入后、重启前自动收尾（大盘先把 ESP 挪到盘尾再扩 root，并可按提示设置主机名与静态网络）；全程校验 SHA256。UEFI 与 BIOS 均可（v2 双启动，不再因 UEFI 中止）。目标盘有已挂载分区时脚本会拒绝并打印救援模式步骤；运行系统里想 DD 请用上面的 kexec 版，不要后台 DD。
 
 ## 手动 DD
 
@@ -64,7 +75,7 @@ growpart /dev/vda 2 && btrfs filesystem resize max /
 
 ## 排查（实测踩过的坑）
 
-- **不要在运行系统里后台 DD**：写盘会覆盖正在运行的系统，sshd 先死、文件系统变只读、SSH 断线；之后面板的优雅重启/关机/重装可能全部无效。正道永远是救援模式（脚本拒绝挂载盘时会打印步骤）。
+- **不要在运行系统里后台 DD**：写盘会覆盖正在运行的系统，sshd 先死、文件系统变只读、SSH 断线；之后面板的优雅重启/关机/重装可能全部无效。运行系统里想 DD 请用 kexec 版（`bash dd-install.sh --oneclick /dev/sda`，先 kexec 进内存系统再写盘），或进救援模式（脚本拒绝挂载盘时会打印步骤）。
 - **探针还在线 ≠ 没重启**：探针进程在内存里继续上报，SSH 断了、VNC 里旧系统日志还在刷，都不代表重启失败；以面板电源状态和新系统是否起来为准。
 - **面板操作没反应**：先等几分钟（面板操作有延迟）；优雅操作对已死的系统无效，改用强制断电；仍无效就找商家工单，写明主机名、IP、请求宿主机强制断电。
 - **VNC 粘贴命令变了形**：面板 VNC 的发送框会把多行粘贴合成一行、长命令截断（约 200 字）；一次只贴一条短命令，命令被合成一行时按 Ctrl+C 取消重贴，不要直接回车。
