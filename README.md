@@ -19,7 +19,7 @@ curl -fsSL https://raw.githubusercontent.com/snnae998/debian13-minimal-dd/main/d
 bash dd-install.sh /dev/vda
 ```
 
-脚本流程：先预检（启动方式、磁盘容量、主网卡名、收尾工具），汇总报告并经你确认后才写入；写入后、重启前自动收尾（网卡不一致时修正配置、大盘自动扩容）；全程校验 SHA256。UEFI 机器预检会直接中止，可用 `bash dd-install.sh /dev/vda --force` 强行继续（但可能无法启动）。
+脚本流程：先确认目标盘（不知道盘名时直接运行 `bash dd-install.sh`，不给盘名，脚本会列出本机磁盘让你选；不要选带数字的分区，DD 必须写整盘），再预检（启动方式、磁盘容量、主网卡名、收尾工具），汇总报告并经你确认后才写入；写入后、重启前自动收尾（网卡不一致时修正配置、大盘自动扩容）；全程校验 SHA256。UEFI 机器预检会直接中止，可用 `bash dd-install.sh /dev/vda --force` 强行继续（但可能无法启动）。
 
 ## 手动 DD
 
