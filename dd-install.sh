@@ -6,29 +6,31 @@
 #   curl -fsSL https://raw.githubusercontent.com/snnae998/debian13-minimal-dd/main/dd-install.sh -o dd-install.sh
 #   bash dd-install.sh /dev/vda
 #   不知道盘名时直接运行 bash dd-install.sh，不给盘名，脚本会列出本机磁盘让你选。
+# 用法（一键模式，运行系统中直接跑，root 运行，需 kexec + DHCP）：
+#   bash dd-install.sh --oneclick /dev/sda
+#   不知道盘名时直接运行 bash dd-install.sh --oneclick，脚本会列出本机磁盘让你选。
+#   跳过确认：bash dd-install.sh --oneclick /dev/sda --yes
+#   内存阶段静态网络（DHCP 失败时备用）：--static-ip 1.2.3.4/24 --static-gw 1.2.3.4 --static-dns "8.8.8.8,1.1.1.1"
+# 一键模式前提：内核支持 kexec 且已装 kexec-tools；内存阶段与新系统均需 DHCP；
+# kexec 触发后旧系统即消失，失败时需面板/VNC/救援恢复；先在测试机上试。
 # 注意：会清空目标盘全部数据；--force 在 v2 已无作用（UEFI 已支持），保留仅为兼容旧命令。
 set -euo pipefail
 
 PARTS_URL="https://github.com/snnae998/debian13-minimal-dd/releases/download/v2.0"
 IMAGE_SHA256="b0710e997638268b2c8fccb03f2f86475cf04936e4564cff6ef5657cb2535493"
 IMAGE_SIZE_MIN=1073741824  # 1 GiB
+# v2 分卷 SHA（逗号分隔，供一键模式内存阶段逐卷校验）
+PART_SHAS="b293011b6cbfba60746887a080755cc1e426962e7e4f2a63af6dafe03a0f6cc0,577d8e1a43a4d044c8f2c7698f0c3b7c5fa60a23a0e523f37440ebaa1d8f280d,64b6f43335455b664ff431e82e19ef51d18c4280e73ccb1bfae27528e6c94dcd,9764fa83042d3aba6ca40d149a02103c8d080f827567527c46b58151e17ea980,8b1442a511c5ac601dab27ebdd147cf55518d33c2e0ff7c16ae51aaf474dbb4a"
+# 一键模式内存系统（initramfs）地址与 SHA
+INITRAMFS_URL_DEFAULT="https://raw.githubusercontent.com/snnae998/debian13-minimal-dd/main/initramfs-dd-v2.cpio.gz"
+INITRAMFS_SHA256="c40124470260b69d63c6286481ac1bc350613129afbaec2bf3b2144fc658ed3e"
 
 # v2 固定布局（1 GiB 镜像内，单位：512 字节扇区）
 ESP_START=1900544
 ESP_SECTORS=153600  # 75MB
 ROOT_PART=2
 ESP_PART=3
-
-FORCE=0
-DISK="${1:-}"
-if [ "${2:-}" = "--force" ]; then
-    FORCE=1
-fi
-
-if [ "$(id -u)" -ne 0 ]; then
-    echo "请用 root 运行本脚本" >&2
-    exit 1
-fi
+IMG_SECTORS=2097152  # 1 GiB / 512
 
 show_disks() {
     echo "本机磁盘如下（选和你机器配置相符的那块整盘，不要选带数字的分区）："
@@ -36,6 +38,155 @@ show_disks() {
     echo "常见盘名：KVM virtio 是 vda，SATA/SCSI 是 sda，NVMe 是 nvme0n1；"
     echo "不要选带数字的分区，如 sda1、vda1、nvme0n1p1。"
 }
+
+# 一键模式：预检 -> 下载内存系统 -> 确认 -> kexec 进内存写盘。
+# 任何一步失败都在 kexec 之前中止，旧系统纹丝不动；kexec 触发后旧系统即消失。
+run_oneclick() {
+    echo "========== 一键 DD（kexec 模式） =========="
+    echo "原理：先在运行系统里预检并下载内存系统，再 kexec 重启进内存，"
+    echo "在内存里写盘（旧系统已不在，不会变僵尸），写完自动重启进新系统。"
+    KERNEL=""
+    if [ -f /boot/vmlinuz ]; then
+        KERNEL="$(readlink -f /boot/vmlinuz)"
+    elif [ -f "/boot/vmlinuz-$(uname -r)" ]; then
+        KERNEL="/boot/vmlinuz-$(uname -r)"
+    else
+        for k in /boot/vmlinuz-*; do
+            [ -f "$k" ] && KERNEL="$k"
+        done
+    fi
+    if [ -z "$KERNEL" ] || [ ! -f "$KERNEL" ]; then
+        echo "中止：找不到本机内核文件（/boot/vmlinuz），无法 kexec，请改走救援模式。" >&2
+        exit 1
+    fi
+    echo "本机内核：$KERNEL"
+    if ! command -v kexec >/dev/null 2>&1; then
+        echo "中止：未找到 kexec（请先安装 kexec-tools，如 apt install kexec-tools），无法一键。" >&2
+        exit 1
+    fi
+    if [ -z "$DISK" ] || [ ! -b "$DISK" ]; then
+        if [ -n "$DISK" ]; then
+            echo "没有找到磁盘：$DISK" >&2
+        fi
+        echo "先看本机磁盘，选一块整盘："
+        show_disks
+        echo
+        read -rp "输入目标盘名（例如 /dev/sda，直接回车退出）: " DISK_INPUT
+        if [ -z "$DISK_INPUT" ]; then
+            echo "已取消"
+            exit 1
+        fi
+        DISK="$DISK_INPUT"
+        if [ ! -b "$DISK" ]; then
+            echo "错误：$DISK 不是块设备，请重新运行并输入上面列表里的盘名。" >&2
+            exit 1
+        fi
+    fi
+    DISK_TYPE="$(lsblk -n -o TYPE "$DISK" 2>/dev/null || echo "")"
+    if [ "$DISK_TYPE" = "part" ]; then
+        echo "错误：$DISK 是分区不是整盘，DD 必须写整盘（如 /dev/sda），请重新运行。" >&2
+        show_disks
+        exit 1
+    fi
+    DISK_SIZE="$(lsblk -b -d -n -o SIZE "$DISK" 2>/dev/null || blockdev --getsize64 "$DISK" 2>/dev/null || echo "")"
+    if [ -n "$DISK_SIZE" ] && [ "$DISK_SIZE" -lt "$IMAGE_SIZE_MIN" ]; then
+        echo "中止：目标盘小于 1 GiB，镜像写不下。" >&2
+        exit 1
+    fi
+    if [ -n "$DISK_SIZE" ]; then
+        echo "目标盘容量：$((DISK_SIZE / 1024 / 1024)) MiB"
+    fi
+    INITRAMFS_URL="${INITRAMFS_URL_OVERRIDE:-$INITRAMFS_URL_DEFAULT}"
+    echo "正在下载内存系统（initramfs，约 6MB）..."
+    cd /tmp
+    if ! curl -L --retry 3 -o dd-initramfs.cpio.gz "$INITRAMFS_URL"; then
+        echo "中止：内存系统下载失败，旧系统未动。" >&2
+        exit 1
+    fi
+    echo "$INITRAMFS_SHA256  dd-initramfs.cpio.gz" | sha256sum -c - || {
+        echo "中止：内存系统 SHA 校验失败，旧系统未动。" >&2
+        exit 1
+    }
+    echo "正在预检镜像地址..."
+    if ! curl -L -I --retry 2 -o /dev/null -w "%{http_code}" "$PARTS_URL/debian13-minimal-dd.img.gz.part00" 2>/dev/null | grep -q '^2'; then
+        echo "中止：镜像地址预检未通过（可能网络问题），旧系统未动。" >&2
+        exit 1
+    fi
+    echo
+    echo "目标盘：$DISK"
+    lsblk "$DISK" || true
+    echo
+    echo "警告：一键 DD 将清空 $DISK 全部数据，且 kexec 触发后当前系统即消失！"
+    echo "内存阶段需要 DHCP 能拿到地址（新系统也是 networkd DHCP）；"
+    echo "若内存阶段联网或下载失败，机器会停在内存系统里，需面板/VNC/救援恢复。"
+    echo "请确认你有面板/VNC/救援入口，且目标盘无重要数据。"
+    if [ "$YES" -ne 1 ]; then
+        read -rp "确认请完整输入 YES： " CONF
+        if [ "$CONF" != "YES" ]; then
+            echo "已取消"
+            exit 1
+        fi
+    fi
+    CMDLINE="console=tty0 dd.target=$DISK dd.parts_url=$PARTS_URL dd.nparts=5 dd.part_shas=$PART_SHAS dd.esp_start=$ESP_START dd.esp_sectors=$ESP_SECTORS dd.img_sectors=$IMG_SECTORS"
+    if [ -n "$STATIC_IP" ]; then
+        CMDLINE="$CMDLINE dd.static_ip=$STATIC_IP"
+    fi
+    if [ -n "$STATIC_GW" ]; then
+        CMDLINE="$CMDLINE dd.static_gw=$STATIC_GW"
+    fi
+    if [ -n "$STATIC_DNS" ]; then
+        CMDLINE="$CMDLINE dd.static_dns=$STATIC_DNS"
+    fi
+    echo "正在载入 kexec（内核 + 内存系统）..."
+    if ! kexec -l "$KERNEL" --initrd=/tmp/dd-initramfs.cpio.gz --append="$CMDLINE"; then
+        echo "中止：kexec 载入失败，旧系统未动。" >&2
+        exit 1
+    fi
+    sync
+    echo "kexec 已触发，正在重启进内存系统写盘（SSH 会断开，属正常）..."
+    echo "写盘完成后机器会自动重启进新系统；若长时间无响应，请进面板/VNC 查看内存系统输出。"
+    sleep 2
+    kexec -e
+    echo "kexec 执行失败，旧系统未动。" >&2
+    exit 1
+}
+
+ONECLICK=0
+YES=0
+FORCE=0
+DISK=""
+STATIC_IP=""
+STATIC_GW=""
+STATIC_DNS=""
+INITRAMFS_URL_OVERRIDE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --oneclick) ONECLICK=1; shift ;;
+        --yes) YES=1; shift ;;
+        --force) FORCE=1; shift ;;
+        --static-ip) STATIC_IP="$2"; shift 2 ;;
+        --static-ip=*) STATIC_IP="${1#--static-ip=}"; shift ;;
+        --static-gw) STATIC_GW="$2"; shift 2 ;;
+        --static-gw=*) STATIC_GW="${1#--static-gw=}"; shift ;;
+        --static-dns) STATIC_DNS="$2"; shift 2 ;;
+        --static-dns=*) STATIC_DNS="${1#--static-dns=}"; shift ;;
+        --initramfs-url) INITRAMFS_URL_OVERRIDE="$2"; shift 2 ;;
+        --initramfs-url=*) INITRAMFS_URL_OVERRIDE="${1#--initramfs-url=}"; shift ;;
+        --) shift; break ;;
+        -*) echo "未知参数：$1" >&2; exit 1 ;;
+        *) if [ -z "$DISK" ]; then DISK="$1"; else echo "多余参数：$1" >&2; exit 1; fi; shift ;;
+    esac
+done
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "请用 root 运行本脚本" >&2
+    exit 1
+fi
+
+if [ "$ONECLICK" -eq 1 ]; then
+    run_oneclick
+    exit 0
+fi
 
 # 磁盘参数：没给或给错时，列出磁盘并引导用户输入
 if [ -z "$DISK" ] || [ ! -b "$DISK" ]; then
@@ -183,11 +334,27 @@ partprobe "$DISK" 2>/dev/null || partx -u "$DISK" 2>/dev/null || blockdev --rere
 ESP_MOVED=0
 if [ "$NEED_EXPAND" -eq 1 ] && [ "$DISK_SECTORS" -gt 0 ]; then
     ESP_END=$((ESP_START + ESP_SECTORS - 1))
-    NEW_ESP_START=$(( (DISK_SECTORS - ESP_SECTORS - 2048) / 2048 * 2048 ))
-    NEW_ESP_END=$((NEW_ESP_START + ESP_SECTORS - 1))
+    # sgdisk 路径：先把备份 GPT 移到盘尾，再读真实 LastUsable 定 ESP 位置
+    # （-e 后 LastUsable 可能比 盘大小-34 少 2048，不能直接用盘大小算）。
+    # sfdisk 路径不受此影响（它按盘大小重写整表），仍用盘大小算。
+    NEW_ESP_START=0
+    NEW_ESP_END=0
+    if [ "$HAVE_SGDISK" -eq 1 ]; then
+        # DD 后 GPT 头仍记录 1 GiB 盘，需先把备份 GPT 移到盘尾。
+        sgdisk -e "$DISK" >/dev/null 2>&1 || true
+        LAST_USABLE=$(sgdisk -p "$DISK" 2>/dev/null | grep 'last usable sector' | awk '{print $NF}')
+        case "$LAST_USABLE" in ''|*[!0-9]*) LAST_USABLE="" ;; esac
+        if [ -n "$LAST_USABLE" ]; then
+            NEW_ESP_START=$(( (LAST_USABLE - ESP_SECTORS + 1) / 2048 * 2048 ))
+            NEW_ESP_END=$((NEW_ESP_START + ESP_SECTORS - 1))
+        fi
+    else
+        NEW_ESP_START=$(( (DISK_SECTORS - ESP_SECTORS - 2048) / 2048 * 2048 ))
+        NEW_ESP_END=$((NEW_ESP_START + ESP_SECTORS - 1))
+    fi
     if [ "$NEW_ESP_START" -ge $((ESP_END + 2048)) ]; then
         echo "正在把 ESP 从 $ESP_START 挪到盘尾 $NEW_ESP_START ..."
-        if dd if="$DISK" of="$DISK" bs=512 skip="$ESP_START" seek="$NEW_ESP_START" count="$ESP_SECTORS" conv=fsync 2>/dev/null; then
+        if dd if="$DISK" of="$DISK" bs=512 skip="$ESP_START" seek="$NEW_ESP_START" count="$ESP_SECTORS" conv=fsync,notrunc 2>/dev/null; then
             sync
             GPT_OK=0
             if [ "$HAVE_SGDISK" -eq 1 ]; then
@@ -214,7 +381,7 @@ if [ "$NEED_EXPAND" -eq 1 ] && [ "$DISK_SECTORS" -gt 0 ]; then
             NEED_EXPAND=0
         fi
     else
-        echo "磁盘仅比镜像大一点，ESP 挪动会重叠，放弃扩容（root 保持约 926MB，系统仍可启动）。"
+        echo "磁盘仅比镜像大一点，或 LastUsable 读不到，ESP 挪动会重叠，放弃扩容（root 保持约 926MB，系统仍可启动）。"
         NEED_EXPAND=0
     fi
 fi
