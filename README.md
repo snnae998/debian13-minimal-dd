@@ -11,20 +11,20 @@
 - 引导：GPT 双启动——p1 BIOS 启动区（1MB，GRUB i386-pc）、p2 root（926MB）、p3 ESP（75MB FAT32，含 BOOTX64.EFI）；BIOS 与 UEFI 机器均可启动
 - 虚拟盘：1 GiB
 - 网络：systemd-networkd，按网卡类型自动匹配所有以太网卡（ens3、ens18、enp*、eth0 均可），内置 DHCP 客户端（镜像内无 dhclient、无 resolved、无 ifupdown）；resolv.conf 静态为 8.8.8.8 / 1.1.1.1（DHCP 时也用它；选静态时脚本同时写 networkd 文件与 resolv.conf）
-- SSH：root 密码登录开启
+- SSH：root 密码登录开启，默认 root 密码为 `nodeseekdebian13js`（首次登录后立即用 `passwd` 改掉，切勿在生产环境继续用）
 - 其他：无 swap、无 cloud-init
 - 首启：自动 btrfs resize max（大盘扩容）+ balance（v2 出厂已是 single，balance 很快完成；期间以 `btrfs filesystem usage /` 为准）
 
 ## 一键 DD（运行系统中，kexec 版）
 
-在运行中的系统里直接 DD，不用进救援模式。脚本先 kexec 进内存里的最小系统（initramfs，约 6MB），再由内存系统写盘——正在运行的系统在 kexec 那一刻就被放弃，不是后台写盘，不会把自己写死。
+在运行中的系统里直接 DD，不用进救援模式。脚本先 kexec 进内存里的最小系统（initramfs，约 13MB，含 curl），再由内存系统写盘——正在运行的系统在 kexec 那一刻就被放弃，不是后台写盘，不会把自己写死。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/snnae998/debian13-minimal-dd/main/dd-install.sh -o dd-install.sh
 bash dd-install.sh --oneclick /dev/sda
 ```
 
-前置条件：目标机内核支持 kexec 且装有 kexec-tools（没有时脚本会在 kexec 前中止，旧系统不受影响）；内存系统与新系统都需要 DHCP 能拿到地址（新系统是 networkd DHCP；DHCP 不可用时可用 `--static-ip/--static-gw/--static-dns` 给内存系统指定静态地址，新系统首登后再改静态）；确认时需输入 `YES`（或加 `--yes` 跳过）。kexec 是不可逆点：执行后当前系统消失，写盘在内存系统里完成（分卷逐个下载、SHA 校验、流式解压写盘；大盘同样先把 ESP 挪到盘尾再扩 root，文件系统扩容仍由新系统首启完成）。中途失败时机器停在内存系统并给出 console shell，用面板/VNC 进去看日志，不要直接重启（半写盘重启会进不了系统）；救援模式仍可用（重启进救援再跑下面的救援版）。镜像包与 v2.0 相同（5 个分卷，SHA 不变），initramfs 由脚本下载并校验 SHA256。
+前置条件：目标机内核支持 kexec 且装有 kexec-tools（没有时脚本会在 kexec 前中止，旧系统不受影响）；不带静态参数时脚本自动检测当前系统的 IP/网关/DNS（手动给的优先）；内存系统 DD 完成后会把这套静态写进新系统（networkd，Type=ether 通用匹配），新系统启动即有 IP、SSH 直接能进，不用再 VNC 改一次；纯 DHCP 时保持原行为；确认时需输入 `YES`（或加 `--yes` 跳过）。kexec 是不可逆点：执行后当前系统消失，写盘在内存系统里完成（分卷逐个下载、SHA 校验、流式解压写盘；大盘同样先把 ESP 挪到盘尾再扩 root，文件系统扩容仍由新系统首启完成）。中途失败时机器停在内存系统并给出 console shell，用面板/VNC 进去看日志，不要直接重启（半写盘重启会进不了系统）；救援模式仍可用（重启进救援再跑下面的救援版）。镜像包与 v2.0 相同（5 个分卷，SHA 不变），initramfs 由脚本下载并校验 SHA256。另外，脚本会在 kexec 前自动把本机硬盘与网卡驱动及 btrfs 模块（含依赖）打包进内存系统，内存系统启动时先加载这些模块再认盘；内存系统下载分卷用 curl（OpenSSL），不用 busybox wget（其 TLS 在部分机器上会 bad MAC 断连）。若本机缺 cpio/xz/zstd，脚本会先尝试 apt 安装，装不上则在 kexec 前中止；要打包的驱动一个都没打包到时也在 kexec 前中止，不盲进内存系统。2026-10-26 实测：DAN-C778L 上不带静态参数一键 DD 成功，新系统启动即有 IP、SSH 直接能进，df 根分区约 20G。kexec 内核优先选与当前运行版本一致的 /boot/vmlinuz-$(uname -r)，以保证打包的模块版本匹配。
 
 ## 一键 DD（救援模式）
 
@@ -59,7 +59,7 @@ growpart /dev/vda 2 && btrfs filesystem resize max /
 
 ## 启动后必做
 
-1. 首次登录后立即修改 root 密码（默认密码见上游项目说明）；
+1. 首次登录后立即修改 root 密码（默认 root 密码为 `nodeseekdebian13js`，登录后立即用 `passwd` 改掉）；
 2. 确认网络：`ip a` 看到正确的 IP，`networkctl status` 看 networkd 状态；只有 169.254 开头时说明 DHCP 失败，按排查章节改静态配置（networkd 文件 + resolv.conf，不再改 interfaces）；
 3. 确认扩容：以 `btrfs filesystem usage /` 为准（Device size 应为整盘；`df -h` 在 btrfs 上显示偏小属正常，不要以 df 为准）；
 4. 确认 balance：`btrfs filesystem df /` 里应全是 single、没有 DUP（v2 出厂即 single）；仍有 DUP 时可手动跑 `btrfs balance start --force -dconvert=single -mconvert=single -sconvert=single /`（mixed 块组必须三项同转，system 须加 `--force`）；
