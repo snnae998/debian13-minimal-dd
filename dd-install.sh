@@ -58,7 +58,13 @@ if [ "$DISK_TYPE" = "part" ]; then
 fi
 
 if lsblk -ln -o MOUNTPOINT "$DISK" 2>/dev/null | grep -q '[^[:space:]]'; then
-    echo "目标盘 $DISK 上有已挂载的分区，请在救援模式下运行，或先卸载" >&2
+    {
+        echo "目标盘 $DISK 上有已挂载的分区，运行系统不能直接 DD（会写坏正在运行的系统）。"
+        echo "请走救援模式，不要用后台 nohup 在运行系统里直接 DD："
+        echo "  1. 在商家面板切到救援模式（Rescue）并重启进救援系统；"
+        echo "  2. 在救援系统里用 root 跑同一条命令：bash dd-install.sh $DISK；"
+        echo "  3. 写完后在面板切回硬盘启动，再重启进新系统。"
+    } >&2
     exit 1
 fi
 
@@ -72,12 +78,13 @@ elif [ ! -d /sys/firmware ]; then
 fi
 echo "启动方式：$BOOT_MODE"
 if [ "$BOOT_MODE" = "UEFI" ] && [ "$FORCE" -ne 1 ]; then
-    echo "中止：本镜像只能 BIOS/Legacy 启动，你的机器是 UEFI，DD 后将无法启动。" >&2
-    echo "请先在商家面板把启动方式切到 BIOS/Legacy，或确认无误后用 bash dd-install.sh $DISK --force 强行继续。" >&2
+    echo "中止：本镜像只能 BIOS/Legacy 启动，你的机器是 UEFI，DD 后固件找不到启动项会掉进 UEFI Shell。" >&2
+    echo "办法：① 在商家面板把启动方式切到 BIOS/Legacy/CSM 再跑；② 或等双启动版镜像。" >&2
+    echo "--force 只是跳过这项检查，写完一样启动不了，不要用它硬上。" >&2
     exit 1
 fi
 if [ "$BOOT_MODE" = "UEFI" ]; then
-    echo "警告：已用 --force 跳过 UEFI 检查，DD 后可能无法启动。"
+    echo "警告：已用 --force 跳过 UEFI 检查，DD 后很可能无法启动（镜像无 EFI 分区）。"
 fi
 if [ "$BOOT_MODE" = "未知" ]; then
     echo "警告：无法判断启动方式，将按 BIOS 处理；如 DD 后无法启动请进 VNC 核对开机画面。"
@@ -191,6 +198,45 @@ if { [ "$NEED_NIC_FIX" -eq 1 ] || [ "$NEED_EXPAND" -eq 1 ]; } && [ "$HAVE_BTRFS"
                 echo "btrfs 扩容失败，首次启动后手动执行：btrfs filesystem resize max /"
             fi
         fi
+        # 主机名（可选，留空保持默认）
+        read -rp "主机名（留空保持默认，直接回车跳过）: " NEW_HOST || true
+        if [ -n "${NEW_HOST:-}" ]; then
+            echo "$NEW_HOST" > /tmp/ddfix/etc/hostname
+            echo "主机名已设为 $NEW_HOST。"
+        fi
+        # 静态网络（可选；镜像无 dhclient，DHCP 不一定能拿到地址）
+        if [ -n "$NIC" ]; then
+            echo "镜像内没有 dhclient，DHCP 可能拿不到地址；如需静态配置请选 y（直接回车保持 DHCP）。"
+            read -rp "是否写入静态网络配置？(y/N): " SET_STATIC || true
+            if [ "${SET_STATIC:-}" = "y" ] || [ "${SET_STATIC:-}" = "Y" ]; then
+                read -rp "IP 地址（如 38.147.165.150）: " STATIC_IP || true
+                if [ -n "${STATIC_IP:-}" ]; then
+                    STATIC_GW_DEFAULT="$(echo "$STATIC_IP" | awk -F. '{print $1"."$2"."$3".1"}')"
+                    read -rp "子网掩码（默认 255.255.255.0）: " STATIC_MASK || true
+                    read -rp "网关（默认 $STATIC_GW_DEFAULT）: " STATIC_GW || true
+                    read -rp "DNS（默认 8.8.8.8 1.1.1.1）: " STATIC_DNS || true
+                    STATIC_MASK="${STATIC_MASK:-255.255.255.0}"
+                    STATIC_GW="${STATIC_GW:-$STATIC_GW_DEFAULT}"
+                    STATIC_DNS="${STATIC_DNS:-8.8.8.8 1.1.1.1}"
+                    {
+                        echo "auto lo"
+                        echo "iface lo inet loopback"
+                        echo "auto $NIC"
+                        echo "iface $NIC inet static"
+                        echo "address $STATIC_IP"
+                        echo "netmask $STATIC_MASK"
+                        echo "gateway $STATIC_GW"
+                        echo "dns-nameservers $STATIC_DNS"
+                    } > /tmp/ddfix/etc/network/interfaces
+                    echo "静态网络已写入，内容如下："
+                    cat /tmp/ddfix/etc/network/interfaces
+                else
+                    echo "未输入 IP，跳过静态配置，保持 DHCP。"
+                fi
+            fi
+        else
+            echo "未能识别网卡，跳过静态配置；首次启动后请进 VNC 按 README 排查章节处理网络。"
+        fi
         umount /tmp/ddfix 2>/dev/null || true
         rmdir /tmp/ddfix 2>/dev/null || true
     else
@@ -217,6 +263,9 @@ sync
 
 echo
 echo "写入完成！接下来："
-echo "  1. 重启进入新系统（需要 BIOS/Legacy 启动）"
-echo "  2. 首次启动 btrfs balance 约 1-3 分钟"
+echo "  1. 重启进入新系统（需要 BIOS/Legacy 启动；若是救援模式，先在面板切回硬盘启动）"
+echo "  2. 首次启动 btrfs balance 约 1-3 分钟（会把元数据转 single，期间 df 显示偏小属正常）"
 echo "  3. 首次登录后立即修改 root 密码"
+echo "  4. 核对：ip a（确认 IP）、btrfs filesystem usage /（确认容量；df 在 btrfs 上显示偏小，以 usage 为准）"
+echo "  5. 若 SSH 报主机密钥变更（DD 后密钥变了），先清理旧密钥再连：ssh-keygen -R <IP>"
+echo "  6. 网络起不来时不要反复重装，先按 README 排查章节走（网卡名、静态配置、DNS）"
