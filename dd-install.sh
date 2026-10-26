@@ -227,6 +227,29 @@ run_oneclick() {
         awk '!seen[$0]++' "$KO_LIST_TMP" > "$KO_LIST_TMP.uniq" 2>/dev/null || cp "$KO_LIST_TMP" "$KO_LIST_TMP.uniq" 2>/dev/null || true
         rm -f "$MOD_LIST_TMP" "$KO_LIST_TMP" || true
         if [ -s "$KO_LIST_TMP.uniq" ]; then
+            # DD 前在好系统里先给全：缺解压工具就先装，装不上就 kexec 前中止，不进内存系统才发现。
+            if grep -q '\.ko\.xz$' "$KO_LIST_TMP.uniq" 2>/dev/null && ! command -v xz >/dev/null 2>&1; then
+                echo "正在安装 xz-utils（解压 .ko.xz 驱动需要）..."
+                if command -v apt-get >/dev/null 2>&1; then
+                    apt-get install -y xz-utils >/dev/null 2>&1 || true
+                fi
+                if ! command -v xz >/dev/null 2>&1; then
+                    echo "中止：需要 xz 来解压 .ko.xz 驱动，但安装失败；请先 apt install xz-utils 后重试，旧系统未动。" >&2
+                    rm -f "$KO_LIST_TMP.uniq" || true
+                    exit 1
+                fi
+            fi
+            if grep -q '\.ko\.zst$' "$KO_LIST_TMP.uniq" 2>/dev/null && ! command -v zstd >/dev/null 2>&1; then
+                echo "正在安装 zstd（解压 .ko.zst 驱动需要）..."
+                if command -v apt-get >/dev/null 2>&1; then
+                    apt-get install -y zstd >/dev/null 2>&1 || true
+                fi
+                if ! command -v zstd >/dev/null 2>&1; then
+                    echo "中止：需要 zstd 来解压 .ko.zst 驱动，但安装失败；请先 apt install zstd 后重试，旧系统未动。" >&2
+                    rm -f "$KO_LIST_TMP.uniq" || true
+                    exit 1
+                fi
+            fi
             if ! command -v cpio >/dev/null 2>&1; then
                 echo "正在安装 cpio（打包驱动需要）..."
                 if command -v apt-get >/dev/null 2>&1; then
@@ -279,7 +302,9 @@ run_oneclick() {
                     exit 1
                 fi
             else
-                echo "警告：未打包到任何驱动模块，直接使用原内存系统（若驱动是内置的则仍可工作）。"
+                echo "中止：要打包的驱动一个都没打包到（可能是解压工具缺失），未进内存系统，旧系统未动；请先 apt install xz-utils zstd 后重试。" >&2
+                rm -rf "$BUNDLE_DIR" || true
+                exit 1
             fi
             rm -rf "$BUNDLE_DIR" || true
         else
